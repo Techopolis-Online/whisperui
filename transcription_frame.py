@@ -9,6 +9,8 @@ import logging
 import os
 from transcription_panel import TranscriptionPanel
 import torch
+from faster_whisper import WhisperModel
+import librosa
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -140,27 +142,39 @@ class TranscriptionFrame(wx.Frame):
         def transcribe_thread():
             try:
                 logging.info(f"Loading model: {model_name}")
-                model = whisper.load_model(model_name)
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                compute_type = "float16" if device == "cuda" else "int8"
+                model = WhisperModel(model_name, device=device, compute_type=compute_type)
+                
                 logging.info(f"Transcribing file: {filepath}")
                 
-                audio = whisper.load_audio(filepath)
-                audio = whisper.pad_or_trim(audio)
-                mel = whisper.log_mel_spectrogram(audio).to(model.device)
+                # Load audio
+                logging.info("Loading audio file")
+                audio, _ = librosa.load(filepath, sr=16000)
                 
-                # Detect the spoken language
-                _, probs = model.detect_language(mel)
-                detected_lang = max(probs, key=probs.get)
+                # Transcribe the audio file in chunks
+                chunk_length = 30 * 16000  # 30 seconds
+                num_chunks = len(audio) // chunk_length + (1 if len(audio) % chunk_length else 0)
                 
-                # Transcribe the entire audio at once
-                options = whisper.DecodingOptions(language=detected_lang, fp16=False)
-                result = model.transcribe(audio, **options.__dict__)
+                for i in range(num_chunks):
+                    if self.transcription_done:
+                        break
+                    
+                    start = i * chunk_length
+                    end = min((i + 1) * chunk_length, len(audio))
+                    chunk = audio[start:end]
+                    
+                    segments, _ = model.transcribe(chunk, beam_size=5)
+                    chunk_text = " ".join([segment.text for segment in segments])
+                    
+                    progress = (i + 1) / num_chunks * 100
+                    self.result_queue.put((chunk_text, progress))
                 
                 logging.info("Transcription complete")
-                logging.debug(f"Transcription result: {result}")
-                self.result_queue.put((result["text"], 100))
             except Exception as e:
-                logging.error(f"Transcription error: {e}", exc_info=True)
-                self.result_queue.put((None, 100))  # Signal error
+                error_msg = f"Transcription error: {str(e)}"
+                logging.error(error_msg, exc_info=True)
+                self.result_queue.put((f"__ERROR__: {error_msg}", 100))
             finally:
                 self.transcription_done = True
 
@@ -176,25 +190,38 @@ class TranscriptionFrame(wx.Frame):
         if self.transcription_done:
             self.timer.Stop()
             wx.CallAfter(self.progress_dialog.Destroy)
-            final_result, _ = self.result_queue.get()
-            if final_result is not None:
-                logging.info("Transcription successful, updating UI")
-                wx.CallAfter(self.update_transcription, final_result)
+            if self.transcription_result:
+                if self.transcription_result.startswith("__ERROR__:"):
+                    error_msg = self.transcription_result[10:]  # Remove "__ERROR__: " prefix
+                    logging.error(f"Transcription failed: {error_msg}")
+                    wx.CallAfter(wx.MessageBox, f"Transcription failed: {error_msg}", "Error", wx.OK | wx.ICON_ERROR)
+                else:
+                    logging.info("Transcription successful, updating UI")
+                    wx.CallAfter(self.update_transcription, self.transcription_result)
             else:
-                logging.error("Transcription failed")
-                wx.CallAfter(wx.MessageBox, "Transcription failed. Please try again.", "Error", wx.OK | wx.ICON_ERROR)
+                logging.error("Transcription failed with unknown error")
+                wx.CallAfter(wx.MessageBox, "Transcription failed with unknown error. Please check the log for details.", "Error", wx.OK | wx.ICON_ERROR)
             return
 
-        elapsed_time = time.time() - self.start_time
-        progress = min(int((elapsed_time / 60) * 100), 99)  # Assume 1 minute for transcription
-        message = f"Transcribing... {progress}% (Elapsed time: {int(elapsed_time)} seconds)"
-        logging.debug(f"Progress: {message}")
-        continue_flag, skip_flag = self.progress_dialog.Update(progress, message)
-
-        if not continue_flag:  # User cancelled
-            logging.info("User cancelled transcription")
-            self.transcription_done = True
-            return
+        try:
+            chunk_result, progress = self.result_queue.get(block=False)
+            if chunk_result.startswith("__ERROR__:"):
+                self.transcription_result = chunk_result
+                self.transcription_done = True
+            elif chunk_result is not None:
+                self.transcription_result += chunk_result + " "
+                wx.CallAfter(self.update_transcription, self.transcription_result)
+            
+            elapsed_time = time.time() - self.start_time
+            message = f"Transcribing... {int(progress)}% (Elapsed time: {int(elapsed_time)} seconds)"
+            logging.debug(f"Progress: {message}")
+            continue_flag, _ = self.progress_dialog.Update(int(progress), message)
+            
+            if not continue_flag:  # User cancelled
+                logging.info("User cancelled transcription")
+                self.transcription_done = True
+        except queue.Empty:
+            pass
 
     def update_transcription(self, transcription):
         logging.info("Updating transcription in UI")
