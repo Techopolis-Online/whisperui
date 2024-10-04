@@ -6,7 +6,9 @@ from scipy.io.wavfile import write
 import numpy as np
 import queue
 import logging
+import os
 from transcription_panel import TranscriptionPanel
+import torch
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -113,12 +115,18 @@ class TranscriptionFrame(wx.Frame):
             if file_dialog.ShowModal() == wx.ID_CANCEL:
                 return
             filepath = file_dialog.GetPath()
+            logging.info(f"Selected file: {filepath}")
+            print(f"Selected file: {filepath}")  # Print to console for immediate feedback
             self.transcribe_file(filepath)
 
     def transcribe_file(self, filepath):
         model_name = self.transcription_model.GetStringSelection()
         if not model_name:
             wx.MessageBox("Please select a model before transcribing.", "No Model Selected", wx.OK | wx.ICON_ERROR)
+            return
+
+        if not os.path.exists(filepath):
+            wx.MessageBox(f"The file '{filepath}' does not exist.", "File Not Found", wx.OK | wx.ICON_ERROR)
             return
 
         self.progress_dialog = wx.ProgressDialog("Transcribing", "Please wait while the audio is being transcribed...",
@@ -134,13 +142,25 @@ class TranscriptionFrame(wx.Frame):
                 logging.info(f"Loading model: {model_name}")
                 model = whisper.load_model(model_name)
                 logging.info(f"Transcribing file: {filepath}")
-                result = model.transcribe(filepath, fp16=False, verbose=True)
+                
+                audio = whisper.load_audio(filepath)
+                audio = whisper.pad_or_trim(audio)
+                mel = whisper.log_mel_spectrogram(audio).to(model.device)
+                
+                # Detect the spoken language
+                _, probs = model.detect_language(mel)
+                detected_lang = max(probs, key=probs.get)
+                
+                # Transcribe the entire audio at once
+                options = whisper.DecodingOptions(language=detected_lang, fp16=False)
+                result = model.transcribe(audio, **options.__dict__)
+                
                 logging.info("Transcription complete")
                 logging.debug(f"Transcription result: {result}")
-                self.result_queue.put(result["text"])
+                self.result_queue.put((result["text"], 100))
             except Exception as e:
                 logging.error(f"Transcription error: {e}", exc_info=True)
-                self.result_queue.put(None)  # Signal error
+                self.result_queue.put((None, 100))  # Signal error
             finally:
                 self.transcription_done = True
 
@@ -156,10 +176,10 @@ class TranscriptionFrame(wx.Frame):
         if self.transcription_done:
             self.timer.Stop()
             wx.CallAfter(self.progress_dialog.Destroy)
-            result = self.result_queue.get()
-            if result is not None:
+            final_result, _ = self.result_queue.get()
+            if final_result is not None:
                 logging.info("Transcription successful, updating UI")
-                wx.CallAfter(self.update_transcription, result)
+                wx.CallAfter(self.update_transcription, final_result)
             else:
                 logging.error("Transcription failed")
                 wx.CallAfter(wx.MessageBox, "Transcription failed. Please try again.", "Error", wx.OK | wx.ICON_ERROR)
